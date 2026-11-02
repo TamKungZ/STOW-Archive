@@ -1,3 +1,4 @@
 [submodule "STOW"]
 	path = STOW
 	url = git@github.com:TamKungZ/STOW.git
+	branch = main
