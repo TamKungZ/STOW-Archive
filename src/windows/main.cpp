@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <shellapi.h>
 
 #include "stow_archive.hpp"
@@ -16,7 +17,17 @@
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"STOWArchiveWindow";
+constexpr wchar_t kCompressionWindowClass[] = L"STOWCompressionProgressWindow";
+constexpr UINT kCompressionFinishedMessage = WM_APP + 1;
 std::wstring g_viewText;
+
+struct CompressionContext {
+    HWND window = nullptr;
+    std::filesystem::path input;
+    std::filesystem::path output;
+    std::string error;
+    bool succeeded = false;
+};
 
 bool SamePath(const std::wstring& left, const std::wstring& right) {
     std::vector<wchar_t> leftFullPath(32768);
@@ -48,6 +59,146 @@ std::wstring Utf8ToWide(const std::string& text) {
 
 void ShowError(const std::wstring& message) {
     MessageBoxW(nullptr, message.c_str(), L"STOW", MB_OK | MB_ICONERROR);
+}
+
+LRESULT CALLBACK CompressionProgressProc(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE: {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        SetWindowLongPtrW(
+            window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        const auto* context = static_cast<const CompressionContext*>(create->lpCreateParams);
+        const std::wstring label =
+            L"Compressing " + context->input.filename().wstring() + L"...";
+        CreateWindowExW(
+            0, L"STATIC", label.c_str(), WS_CHILD | WS_VISIBLE,
+            20, 18, 410, 24, window, nullptr, create->hInstance, nullptr);
+        HWND progress = CreateWindowExW(
+            0, PROGRESS_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | PBS_MARQUEE,
+            20, 52, 410, 20, window, nullptr, create->hInstance, nullptr);
+        if (progress == nullptr) {
+            return -1;
+        }
+        SendMessageW(progress, PBM_SETMARQUEE, TRUE, 30);
+        CreateWindowExW(
+            0, L"STATIC", L"Please wait while STOW creates the archive.",
+            WS_CHILD | WS_VISIBLE,
+            20, 82, 410, 22, window, nullptr, create->hInstance, nullptr);
+        return 0;
+    }
+    case kCompressionFinishedMessage: {
+        auto* context = reinterpret_cast<CompressionContext*>(lParam);
+        if (context == nullptr ||
+            reinterpret_cast<CompressionContext*>(GetWindowLongPtrW(window, GWLP_USERDATA)) !=
+                context) {
+            return 0;
+        }
+        if (context->succeeded) {
+            MessageBoxW(
+                window,
+                L"Archive created successfully.",
+                L"STOW",
+                MB_OK | MB_ICONINFORMATION);
+        } else {
+            ShowError(Utf8ToWide(context->error));
+        }
+        DestroyWindow(window);
+        return 0;
+    }
+    case WM_CLOSE:
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+}
+
+DWORD WINAPI CompressOnWorkerThread(void* parameter) {
+    auto* context = static_cast<CompressionContext*>(parameter);
+    context->succeeded =
+        stow_archive::Compress(context->output, {context->input}, context->error);
+    SendMessageW(
+        context->window,
+        kCompressionFinishedMessage,
+        0,
+        reinterpret_cast<LPARAM>(context));
+    return 0;
+}
+
+bool RunCompressionWithProgress(
+    const std::filesystem::path& input, const std::filesystem::path& output) {
+    INITCOMMONCONTROLSEX commonControls{
+        .dwSize = sizeof(INITCOMMONCONTROLSEX),
+        .dwICC = ICC_PROGRESS_CLASS,
+    };
+    if (!InitCommonControlsEx(&commonControls)) {
+        ShowError(L"Could not initialize the compression progress indicator.");
+        return false;
+    }
+
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    const WNDCLASSW windowClass{
+        .lpfnWndProc = CompressionProgressProc,
+        .hInstance = instance,
+        .hCursor = LoadCursorW(nullptr, IDC_ARROW),
+        .hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1),
+        .lpszClassName = kCompressionWindowClass,
+    };
+    if (!RegisterClassW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        ShowError(L"Could not register the compression progress window.");
+        return false;
+    }
+
+    constexpr int kWindowWidth = 470;
+    constexpr int kWindowHeight = 155;
+    const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    CompressionContext context{
+        .input = input,
+        .output = output,
+    };
+    context.window = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kCompressionWindowClass,
+        L"STOW - Compressing",
+        WS_CAPTION | WS_SYSMENU,
+        (screenWidth - kWindowWidth) / 2,
+        (screenHeight - kWindowHeight) / 2,
+        kWindowWidth,
+        kWindowHeight,
+        nullptr,
+        nullptr,
+        instance,
+        &context);
+    if (context.window == nullptr) {
+        ShowError(L"Could not create the compression progress window.");
+        return false;
+    }
+
+    HANDLE worker = CreateThread(
+        nullptr, 0, CompressOnWorkerThread, &context, 0, nullptr);
+    if (worker == nullptr) {
+        DestroyWindow(context.window);
+        ShowError(L"Could not start the compression task.");
+        return false;
+    }
+
+    ShowWindow(context.window, SW_SHOW);
+    UpdateWindow(context.window);
+
+    MSG message{};
+    int messageResult = 0;
+    while ((messageResult = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    WaitForSingleObject(worker, INFINITE);
+    CloseHandle(worker);
+    return messageResult >= 0 && context.succeeded;
 }
 
 bool GetSelectedFile(const std::vector<std::wstring>& arguments, std::wstring& path) {
@@ -171,16 +322,11 @@ int CompressFile(const std::wstring& inputPath) {
         return 1;
     }
 
-    std::string error;
-    if (!stow_archive::Compress(
-            std::filesystem::path(outputPath.data()),
-            {std::filesystem::path(inputPath)},
-            error)) {
-        ShowError(Utf8ToWide(error));
-        return 1;
-    }
-    MessageBoxW(nullptr, L"Archive created successfully.", L"STOW", MB_OK | MB_ICONINFORMATION);
-    return 0;
+    return RunCompressionWithProgress(
+        std::filesystem::path(inputPath),
+        std::filesystem::path(outputPath.data()))
+        ? 0
+        : 1;
 }
 
 int ExtractFile(const std::wstring& archivePath) {

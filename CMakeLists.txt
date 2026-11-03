@@ -106,7 +106,10 @@ if(WIN32)
         "${STOW_WINDOWS_ICON_RESOURCE}"
     )
     set_target_properties(stow_app PROPERTIES OUTPUT_NAME stow)
-    target_link_libraries(stow_app PRIVATE stow_archive user32 gdi32 comdlg32 shell32)
+    target_link_libraries(stow_app PRIVATE stow_archive user32 gdi32 comdlg32 shell32 comctl32)
+    if(MSVC)
+        target_link_options(stow_app PRIVATE /MANIFEST:NO)
+    endif()
     add_custom_command(TARGET stow_app POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${STOW_CABI_RUNTIME}"
@@ -128,6 +131,9 @@ if(WIN32)
     )
     set_target_properties(stow_cli PROPERTIES OUTPUT_NAME stow-cli)
     target_link_libraries(stow_cli PRIVATE stow_archive advapi32 shell32)
+    if(MSVC)
+        target_link_options(stow_cli PRIVATE /MANIFEST:NO)
+    endif()
     add_custom_command(TARGET stow_cli POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${STOW_CABI_RUNTIME}"
