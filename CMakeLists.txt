@@ -68,6 +68,13 @@ target_include_directories(stow_archive PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/incl
 target_link_libraries(stow_archive PUBLIC STOW::CABI)
 
 if(WIN32)
+    set(STOW_WINDOWS_ICON_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/stow_icon.rc")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/windows/app.rc.in"
+        "${STOW_WINDOWS_ICON_RESOURCE}"
+        @ONLY
+    )
+
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
         set(STOW_INSTALLER_ARCH x64)
         set(_stow_redist_arch x64)
@@ -94,7 +101,10 @@ if(WIN32)
         endif()
     endif()
 
-    add_executable(stow_app WIN32 src/windows/main.cpp)
+    add_executable(stow_app WIN32
+        src/windows/main.cpp
+        "${STOW_WINDOWS_ICON_RESOURCE}"
+    )
     set_target_properties(stow_app PROPERTIES OUTPUT_NAME stow)
     target_link_libraries(stow_app PRIVATE stow_archive user32 gdi32 comdlg32 shell32)
     add_custom_command(TARGET stow_app POST_BUILD
@@ -112,7 +122,10 @@ if(WIN32)
         )
     endif()
 
-    add_executable(stow_cli src/windows/cli.cpp)
+    add_executable(stow_cli
+        src/windows/cli.cpp
+        "${STOW_WINDOWS_ICON_RESOURCE}"
+    )
     set_target_properties(stow_cli PROPERTIES OUTPUT_NAME stow-cli)
     target_link_libraries(stow_cli PRIVATE stow_archive advapi32 shell32)
     add_custom_command(TARGET stow_cli POST_BUILD

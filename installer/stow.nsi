@@ -1,5 +1,8 @@
 !include "MUI2.nsh"
 
+!ifndef APP_ICON
+!define APP_ICON "${__FILEDIR__}\..\assets\icon.ico"
+!endif
 !ifndef APP_NAME
 !define APP_NAME "STOW Archive"
 !endif
@@ -18,6 +21,8 @@
 
 Name "${APP_NAME}"
 OutFile "${OUTPUT_FILE}"
+Icon "${APP_ICON}"
+UninstallIcon "${APP_ICON}"
 InstallDir "$LOCALAPPDATA\Programs\${APP_NAME}"
 InstallDirRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\STOWArchive" "InstallLocation"
 RequestExecutionLevel user
