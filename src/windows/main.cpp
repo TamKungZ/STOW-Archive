@@ -8,18 +8,28 @@
 
 #include "stow_archive.hpp"
 
-#include <algorithm>
 #include <filesystem>
-#include <iterator>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"STOWArchiveWindow";
+constexpr wchar_t kCompressionSettingsWindowClass[] = L"STOWCompressionSettingsWindow";
 constexpr wchar_t kCompressionWindowClass[] = L"STOWCompressionProgressWindow";
 constexpr UINT kCompressionFinishedMessage = WM_APP + 1;
+constexpr int kOutputPathControlId = 1001;
+constexpr int kBrowseControlId = 1002;
+constexpr int kStartCompressionControlId = 1003;
+constexpr int kCancelCompressionControlId = 1004;
 std::wstring g_viewText;
+
+struct CompressionSettingsContext {
+    std::filesystem::path input;
+    std::filesystem::path output;
+    bool accepted = false;
+};
 
 struct CompressionContext {
     HWND window = nullptr;
@@ -59,6 +69,254 @@ std::wstring Utf8ToWide(const std::string& text) {
 
 void ShowError(const std::wstring& message) {
     MessageBoxW(nullptr, message.c_str(), L"STOW", MB_OK | MB_ICONERROR);
+}
+
+LRESULT CALLBACK CompressionSettingsProc(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_NCCREATE: {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
+        if (result != FALSE) {
+            SetWindowLongPtrW(
+                window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+        }
+        return result;
+    }
+    case WM_CREATE: {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        const auto* context =
+            static_cast<const CompressionSettingsContext*>(create->lpCreateParams);
+        const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        auto createControl = [&](DWORD extendedStyle, const wchar_t* className,
+                                 const wchar_t* text, DWORD style, int x, int y,
+                                 int width, int height, int id) {
+            HWND control = CreateWindowExW(
+                extendedStyle,
+                className,
+                text,
+                WS_CHILD | WS_VISIBLE | style,
+                x,
+                y,
+                width,
+                height,
+                window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                create->hInstance,
+                nullptr);
+            if (control != nullptr) {
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            }
+            return control;
+        };
+
+        const std::wstring sourceLabel =
+            L"Source: " + context->input.filename().wstring();
+        if (createControl(0, L"STATIC", sourceLabel.c_str(), 0, 18, 14, 520, 22, 0) == nullptr ||
+            createControl(0, L"STATIC", L"Archive file:", 0, 18, 48, 92, 24, 0) == nullptr) {
+            return -1;
+        }
+
+        const HWND pathEdit = createControl(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            context->output.wstring().c_str(),
+            ES_AUTOHSCROLL | WS_TABSTOP,
+            112,
+            44,
+            350,
+            28,
+            kOutputPathControlId);
+        const HWND browseButton = createControl(
+            0, L"BUTTON", L"Browse...", WS_TABSTOP, 470, 44, 88, 28, kBrowseControlId);
+        const HWND compressButton = createControl(
+            0,
+            L"BUTTON",
+            L"Compress",
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+            360,
+            94,
+            96,
+            30,
+            kStartCompressionControlId);
+        const HWND cancelButton = createControl(
+            0,
+            L"BUTTON",
+            L"Cancel",
+            WS_TABSTOP,
+            462,
+            94,
+            96,
+            30,
+            kCancelCompressionControlId);
+        if (pathEdit == nullptr || browseButton == nullptr ||
+            compressButton == nullptr || cancelButton == nullptr) {
+            return -1;
+        }
+        SetFocus(pathEdit);
+        return 0;
+    }
+    case WM_COMMAND: {
+        const int controlId = LOWORD(wParam);
+        if (controlId == kBrowseControlId) {
+            std::vector<wchar_t> path(32768);
+            const int length = GetWindowTextW(
+                GetDlgItem(window, kOutputPathControlId),
+                path.data(),
+                static_cast<int>(path.size()));
+            if (length <= 0) {
+                ShowError(L"Enter an archive file name before browsing.");
+                return 0;
+            }
+
+            OPENFILENAMEW dialog{};
+            dialog.lStructSize = sizeof(dialog);
+            dialog.lpstrFilter = L"STOW archives (*.sto)\0*.sto\0All files (*.*)\0*.*\0";
+            dialog.lpstrFile = path.data();
+            dialog.nMaxFile = static_cast<DWORD>(path.size());
+            dialog.lpstrDefExt = L"sto";
+            dialog.Flags =
+                OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+            if (GetSaveFileNameW(&dialog)) {
+                SetWindowTextW(GetDlgItem(window, kOutputPathControlId), path.data());
+            } else if (CommDlgExtendedError() != 0) {
+                ShowError(L"Could not open the archive save dialog.");
+            }
+            return 0;
+        }
+
+        if (controlId == kCancelCompressionControlId) {
+            DestroyWindow(window);
+            return 0;
+        }
+
+        if (controlId == kStartCompressionControlId) {
+            auto* context = reinterpret_cast<CompressionSettingsContext*>(
+                GetWindowLongPtrW(window, GWLP_USERDATA));
+            if (context == nullptr) {
+                ShowError(L"Could not read the compression settings.");
+                return 0;
+            }
+
+            std::vector<wchar_t> path(32768);
+            const int length = GetWindowTextW(
+                GetDlgItem(window, kOutputPathControlId),
+                path.data(),
+                static_cast<int>(path.size()));
+            if (length <= 0) {
+                ShowError(L"Enter a name for the archive.");
+                return 0;
+            }
+            context->output = std::filesystem::path(path.data());
+            if (context->output.extension().empty()) {
+                context->output += L".sto";
+            }
+            if (SamePath(context->input.wstring(), context->output.wstring())) {
+                ShowError(L"The archive output cannot overwrite the selected input.");
+                return 0;
+            }
+
+            std::error_code filesystemError;
+            const auto parent = context->output.parent_path().empty()
+                ? std::filesystem::current_path(filesystemError)
+                : context->output.parent_path();
+            if (filesystemError || !std::filesystem::is_directory(parent, filesystemError) ||
+                filesystemError) {
+                ShowError(L"The selected output folder does not exist.");
+                return 0;
+            }
+            if (std::filesystem::exists(context->output, filesystemError)) {
+                if (filesystemError) {
+                    ShowError(L"Could not check the selected output file.");
+                    return 0;
+                }
+                if (MessageBoxW(
+                        window,
+                        L"The archive already exists. Replace it?",
+                        L"STOW",
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                    return 0;
+                }
+            } else if (filesystemError) {
+                ShowError(L"Could not check the selected output file.");
+                return 0;
+            }
+
+            context->accepted = true;
+            DestroyWindow(window);
+            return 0;
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    default:
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+}
+
+bool ShowCompressionSettings(
+    const std::filesystem::path& input, std::filesystem::path& output) {
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    const WNDCLASSW windowClass{
+        .lpfnWndProc = CompressionSettingsProc,
+        .hInstance = instance,
+        .hCursor = LoadCursorW(nullptr, IDC_ARROW),
+        .hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1),
+        .lpszClassName = kCompressionSettingsWindowClass,
+    };
+    if (!RegisterClassW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        ShowError(L"Could not register the compression settings window.");
+        return false;
+    }
+
+    CompressionSettingsContext context{
+        .input = input,
+        .output = input.parent_path() / (input.stem().wstring() + L".sto"),
+    };
+    constexpr int kWindowWidth = 590;
+    constexpr int kWindowHeight = 180;
+    const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    HWND window = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kCompressionSettingsWindowClass,
+        L"STOW - Compression settings",
+        WS_CAPTION | WS_SYSMENU,
+        (screenWidth - kWindowWidth) / 2,
+        (screenHeight - kWindowHeight) / 2,
+        kWindowWidth,
+        kWindowHeight,
+        nullptr,
+        nullptr,
+        instance,
+        &context);
+    if (window == nullptr) {
+        ShowError(L"Could not create the compression settings window.");
+        return false;
+    }
+
+    ShowWindow(window, SW_SHOW);
+    UpdateWindow(window);
+    MSG message{};
+    int messageResult = 0;
+    while ((messageResult = GetMessageW(&message, nullptr, 0, 0)) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    if (messageResult < 0) {
+        ShowError(L"Could not process the compression settings window.");
+        return false;
+    }
+    if (context.accepted) {
+        output = std::move(context.output);
+        return true;
+    }
+    return false;
 }
 
 LRESULT CALLBACK CompressionProgressProc(
@@ -297,34 +555,14 @@ int ShowArchiveViewer(const std::wstring& archivePath, HINSTANCE instance, int s
 
 int CompressFile(const std::wstring& inputPath) {
     const std::filesystem::path input(inputPath);
-    std::vector<wchar_t> outputPath(32768);
-    const std::wstring defaultName = input.stem().wstring() + L".sto";
-    if (defaultName.size() >= outputPath.size()) {
-        ShowError(L"The selected file name is too long.");
-        return 1;
-    }
-    std::copy(defaultName.begin(), defaultName.end(), outputPath.begin());
-
-    const std::wstring initialDirectory = input.parent_path().wstring();
-    OPENFILENAMEW dialog{};
-    dialog.lStructSize = sizeof(dialog);
-    dialog.lpstrFilter = L"STOW archives (*.sto)\0*.sto\0All files (*.*)\0*.*\0";
-    dialog.lpstrFile = outputPath.data();
-    dialog.nMaxFile = static_cast<DWORD>(outputPath.size());
-    dialog.lpstrInitialDir = initialDirectory.empty() ? nullptr : initialDirectory.c_str();
-    dialog.lpstrDefExt = L"sto";
-    dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
-    if (!GetSaveFileNameW(&dialog)) {
-        return CommDlgExtendedError() == 0 ? 0 : 1;
-    }
-    if (SamePath(inputPath, outputPath.data())) {
-        ShowError(L"The archive output cannot overwrite the selected input.");
-        return 1;
+    std::filesystem::path output;
+    if (!ShowCompressionSettings(input, output)) {
+        return 0;
     }
 
     return RunCompressionWithProgress(
-        std::filesystem::path(inputPath),
-        std::filesystem::path(outputPath.data()))
+        input,
+        output)
         ? 0
         : 1;
 }
